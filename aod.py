@@ -9,13 +9,19 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://apt3.activeaero.com"
-TASKS_URL = f"{BASE_URL}/Provider/statusboard/StatusBoard.cfm?selectedTab=tasksDIV&showGroundAddresses=false"
+BASE_URL = "https://apt6.activeaero.com"
+SSKEY = os.getenv("SSKEY", "").strip()
+
+TASKS_URL = (
+    f"{BASE_URL}/Provider/statusboard/statusboard.cfm"
+    f"?sskey={SSKEY}&selectedTab=tasksDIV&showGroundAddresses=false"
+)
+
 DETAIL_URL = f"{BASE_URL}/Provider/statusboard/ProviderBiddingDetail.cfm"
 
 STATE_FILE = "sent_state.json"
-POLL_SECONDS = 5
-ERROR_SLEEP_SECONDS = 10
+POLL_SECONDS = 8
+ERROR_SLEEP_SECONDS = 12
 COOKIE_DEAD_SLEEP_SECONDS = 60
 REQUEST_TIMEOUT = 30
 
@@ -23,8 +29,8 @@ COOKIE = os.getenv("COOKIE", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-if not COOKIE or not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("COOKIE, BOT_TOKEN, CHAT_ID variables to'liq kiritilmagan")
+if not COOKIE or not BOT_TOKEN or not CHAT_ID or not SSKEY:
+    raise RuntimeError("COOKIE, BOT_TOKEN, CHAT_ID, SSKEY to'liq kiritilmagan")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,16 +42,11 @@ session.headers.update({
     "User-Agent": "Mozilla/5.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Cookie": COOKIE,
-    "Referer": TASKS_URL,
+    "Referer": f"{BASE_URL}/Login/ForceLogout.cfm",
     "Origin": BASE_URL,
 })
 
-cookie_dead_notified = False
 
-
-# =========================
-# HELPERS
-# =========================
 def cleanup(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -66,7 +67,12 @@ def is_login_page(html_text: str) -> bool:
 def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            data.setdefault("shipments", {})
+            data.setdefault("meta", {})
+            data["meta"].setdefault("startup_sent", False)
+            data["meta"].setdefault("cookie_dead_notified", False)
+            return data
     except Exception:
         return {
             "shipments": {},
@@ -83,15 +89,8 @@ def save_state(data: dict) -> None:
 
 
 state = load_state()
-state.setdefault("shipments", {})
-state.setdefault("meta", {})
-state["meta"].setdefault("startup_sent", False)
-state["meta"].setdefault("cookie_dead_notified", False)
 
 
-# =========================
-# TELEGRAM
-# =========================
 def telegram_request(method: str, data: dict) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     r = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
@@ -135,7 +134,12 @@ def send_startup_message_once() -> None:
         return
 
     try:
-        send_msg("✅ <b>AOD bot ishga tushdi</b>\n\nMonitoring boshlandi.")
+        send_msg(
+            "✅ <b>AOD bot ishga tushdi</b>\n\n"
+            f"Domain: <code>{escape_html(BASE_URL)}</code>\n"
+            f"SSKEY: <code>{escape_html(SSKEY)}</code>\n"
+            "Monitoring boshlandi."
+        )
         state["meta"]["startup_sent"] = True
         save_state(state)
     except Exception as e:
@@ -143,14 +147,14 @@ def send_startup_message_once() -> None:
 
 
 def notify_cookie_dead_once() -> None:
-    global cookie_dead_notified
-
-    if cookie_dead_notified or state["meta"].get("cookie_dead_notified"):
+    if state["meta"].get("cookie_dead_notified"):
         return
 
     try:
-        send_msg("❗ <b>Cookie o'lgan</b>\n\nRailway Variables ichidagi <code>COOKIE</code> ni yangilash kerak.")
-        cookie_dead_notified = True
+        send_msg(
+            "❗ <b>Cookie o'lgan yoki session tushgan</b>\n\n"
+            "Railway Variables ichidagi <code>COOKIE</code> ni yangilash kerak."
+        )
         state["meta"]["cookie_dead_notified"] = True
         save_state(state)
     except Exception as e:
@@ -158,15 +162,13 @@ def notify_cookie_dead_once() -> None:
 
 
 def reset_cookie_dead_flag() -> None:
-    global cookie_dead_notified
-    cookie_dead_notified = False
+    if not state["meta"].get("cookie_dead_notified"):
+        return
+
     state["meta"]["cookie_dead_notified"] = False
     save_state(state)
 
 
-# =========================
-# MAP BUTTON
-# =========================
 def map_btn(origin: str, dest: str) -> dict:
     url = (
         "https://www.google.com/maps/dir/?api=1"
@@ -181,135 +183,6 @@ def map_btn(origin: str, dest: str) -> dict:
     }
 
 
-# =========================
-# TASKS
-# =========================
-def get_tasks() -> list[dict]:
-    r = session.get(TASKS_URL, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    html_text = r.text
-
-    if is_login_page(html_text):
-        notify_cookie_dead_once()
-        logging.warning("Cookie o'lgan yoki login page qaytdi.")
-        time.sleep(COOKIE_DEAD_SLEEP_SECONDS)
-        return []
-
-    # cookie tirik bo'lsa flagni reset qilamiz
-    if state["meta"].get("cookie_dead_notified"):
-        reset_cookie_dead_flag()
-
-    soup = BeautifulSoup(html_text, "html.parser")
-
-    provider_id = ""
-    provider_input = soup.find("input", {"id": "providerId"})
-    if provider_input and provider_input.get("value"):
-        provider_id = provider_input["value"].strip()
-
-    main_table = soup.find("table", class_=lambda c: c and "striped" in c and "full-width" in c)
-    if not main_table:
-        return []
-
-    tasks = []
-
-    for row in main_table.find_all("tr"):
-        link = row.find("a", onclick=True)
-        if not link:
-            continue
-
-        onclick = link.get("onclick", "")
-        match = re.search(r"launchBidDetail\('([^']+)','([^']+)','([^']+)'\)", onclick)
-        if not match:
-            continue
-
-        shipment_id, rfq_id, selected_tab = match.groups()
-
-        cells = row.find_all("td")
-        if len(cells) < 5:
-            continue
-
-        task_name = cleanup(cells[2].get_text(" ", strip=True))
-
-        from_loc = ""
-        to_loc = ""
-        ready = ""
-        need = ""
-
-        info_table = cells[3].find("table")
-        if info_table:
-            info_rows = info_table.find_all("tr")
-
-            if len(info_rows) >= 1:
-                tds = info_rows[0].find_all("td")
-                if len(tds) >= 4:
-                    from_loc = cleanup(tds[1].get_text(" ", strip=True))
-                    to_loc = cleanup(tds[3].get_text(" ", strip=True))
-
-            if len(info_rows) >= 2:
-                tds = info_rows[1].find_all("td")
-                if len(tds) >= 4:
-                    ready = cleanup(tds[1].get_text(" ", strip=True))
-                    need = cleanup(tds[3].get_text(" ", strip=True))
-
-        tasks.append({
-            "shipment_id": shipment_id,
-            "rfq_id": rfq_id,
-            "selected_tab": selected_tab,
-            "provider_id": provider_id,
-            "task_name": task_name,
-            "from": from_loc,
-            "to": to_loc,
-            "ready": ready,
-            "need": need,
-        })
-
-    return tasks
-
-
-# =========================
-# DETAIL
-# =========================
-def get_detail(task: dict) -> dict:
-    data = {
-        "providerId": task["provider_id"],
-        "shipmentId": task["shipment_id"],
-        "shipmentRFQId": task["rfq_id"],
-        "selectedTab": task["selected_tab"],
-    }
-
-    r = session.post(DETAIL_URL, data=data, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    html_text = r.text
-
-    if is_login_page(html_text):
-        raise RuntimeError("Detail ochishda login page qaytdi.")
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    text = cleanup(soup.get_text("\n", strip=True))
-
-    distance = ""
-    m = re.search(r"(\d+(?:,\d+)?(?:\.\d+)?)\s*mi", text, re.I)
-    if m:
-        distance = f"{m.group(1)} mi"
-
-    team_driver = "TEAM DRIVER" if "TEAM DRIVER" in text.upper() else ""
-
-    customer = ""
-    m = re.search(r"Customer\s+(.+?)\s+Include cost of fuel", text, re.I)
-    if m:
-        customer = cleanup(m.group(1))
-
-    return {
-        "distance": distance,
-        "team_driver": team_driver,
-        "customer": customer,
-        "raw_text": text[:1500],
-    }
-
-
-# =========================
-# MESSAGE BUILDERS
-# =========================
 def build_initial_message(task: dict) -> str:
     return (
         "🚨 <b>NEW TASK LOAD</b>\n\n"
@@ -349,9 +222,123 @@ def build_full_message(task: dict, detail: dict) -> str:
     return "\n".join(parts)
 
 
-# =========================
-# MAIN LOOP
-# =========================
+def get_tasks() -> list[dict]:
+    r = session.get(TASKS_URL, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    html_text = r.text
+
+    if is_login_page(html_text):
+        notify_cookie_dead_once()
+        logging.warning("Cookie o'lgan yoki login page qaytdi.")
+        time.sleep(COOKIE_DEAD_SLEEP_SECONDS)
+        return []
+
+    reset_cookie_dead_flag()
+
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    provider_id = ""
+    provider_input = soup.find("input", {"id": "providerId"})
+    if provider_input and provider_input.get("value"):
+        provider_id = provider_input["value"].strip()
+
+    main_table = soup.find("table", class_=lambda c: c and "striped" in c and "full-width" in c)
+    if not main_table:
+        return []
+
+    tasks = []
+
+    for row in main_table.find_all("tr"):
+        link = row.find("a", onclick=True)
+        if not link:
+            continue
+
+        onclick = link.get("onclick", "")
+        match = re.search(r"launchBidDetail\('([^']+)','([^']+)','([^']+)'\)", onclick)
+        if not match:
+            continue
+
+        shipment_id, rfq_id, selected_tab = match.groups()
+
+        cells = row.find_all("td")
+        if len(cells) < 5:
+            continue
+
+        task_name = cleanup(cells[2].get_text(" ", strip=True))
+        from_loc = ""
+        to_loc = ""
+        ready = ""
+        need = ""
+
+        info_table = cells[3].find("table")
+        if info_table:
+            info_rows = info_table.find_all("tr")
+
+            if len(info_rows) >= 1:
+                tds = info_rows[0].find_all("td")
+                if len(tds) >= 4:
+                    from_loc = cleanup(tds[1].get_text(" ", strip=True))
+                    to_loc = cleanup(tds[3].get_text(" ", strip=True))
+
+            if len(info_rows) >= 2:
+                tds = info_rows[1].find_all("td")
+                if len(tds) >= 4:
+                    ready = cleanup(tds[1].get_text(" ", strip=True))
+                    need = cleanup(tds[3].get_text(" ", strip=True))
+
+        tasks.append({
+            "shipment_id": shipment_id,
+            "rfq_id": rfq_id,
+            "selected_tab": selected_tab,
+            "provider_id": provider_id,
+            "task_name": task_name,
+            "from": from_loc,
+            "to": to_loc,
+            "ready": ready,
+            "need": need,
+        })
+
+    return tasks
+
+
+def get_detail(task: dict) -> dict:
+    data = {
+        "providerId": task["provider_id"],
+        "shipmentId": task["shipment_id"],
+        "shipmentRFQId": task["rfq_id"],
+        "selectedTab": task["selected_tab"],
+    }
+
+    r = session.post(DETAIL_URL, data=data, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    html_text = r.text
+
+    if is_login_page(html_text):
+        raise RuntimeError("Detail ochishda login page qaytdi.")
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = cleanup(soup.get_text("\n", strip=True))
+
+    distance = ""
+    m = re.search(r"(\d+(?:,\d+)?(?:\.\d+)?)\s*mi", text, re.I)
+    if m:
+        distance = f"{m.group(1)} mi"
+
+    team_driver = "TEAM DRIVER" if "TEAM DRIVER" in text.upper() else ""
+
+    customer = ""
+    m = re.search(r"Customer\s+(.+?)\s+Include cost of fuel", text, re.I)
+    if m:
+        customer = cleanup(m.group(1))
+
+    return {
+        "distance": distance,
+        "team_driver": team_driver,
+        "customer": customer,
+        "raw_text": text[:1500],
+    }
+
+
 def main():
     logging.info("AOD started...")
     send_startup_message_once()
@@ -360,9 +347,7 @@ def main():
         try:
             tasks = get_tasks()
 
-            if not tasks:
-                logging.info("Tasks bo'sh.")
-            else:
+            if tasks:
                 logging.info("Tasks: %s", len(tasks))
 
             for task in tasks:
