@@ -1,0 +1,5 @@
+cookie*.txt
+token*.txt
+chat_id*.txt
+*.json
+__pycache__/
