@@ -104,7 +104,10 @@ def get_tasks():
     html = r.text
 
     if is_login_page(html):
-        raise RuntimeError("Cookie o'lgan yoki login sahifaga qaytdi.")
+    print("❗ COOKIE O'LGAN - YANGILASH KERAK")
+    send_msg("❗ Cookie o'lgan, yangilash kerak")
+    time.sleep(60)
+    return []
 
     soup = BeautifulSoup(html, "html.parser")
 
