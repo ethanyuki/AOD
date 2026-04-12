@@ -12,11 +12,7 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://apt6.activeaero.com"
 SSKEY = os.getenv("SSKEY", "").strip()
 
-TASKS_URL = (
-    f"{BASE_URL}/Provider/statusboard/statusboard.cfm"
-    f"?sskey={SSKEY}&selectedTab=tasksDIV&showGroundAddresses=false"
-)
-
+TASKS_URL = f"{BASE_URL}/Provider/statusboard/statusboard.cfm?sskey={SSKEY}"
 DETAIL_URL = f"{BASE_URL}/Provider/statusboard/ProviderBiddingDetail.cfm"
 
 STATE_FILE = "sent_state.json"
@@ -37,16 +33,22 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Cookie": COOKIE,
-    "Referer": f"{BASE_URL}/Login/ForceLogout.cfm",
-    "Origin": BASE_URL,
-})
+HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "accept-language": "en-US,en;q=0.9,pl;q=0.8,ru;q=0.7",
+    "cache-control": "max-age=0",
+    "referer": TASKS_URL,
+    "upgrade-insecure-requests": "1",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "cookie": COOKIE,
+}
+
+state = {}
 
 
+# =========================
+# HELPERS
+# =========================
 def cleanup(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -88,9 +90,9 @@ def save_state(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-state = load_state()
-
-
+# =========================
+# TELEGRAM
+# =========================
 def telegram_request(method: str, data: dict) -> dict:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     r = requests.post(url, data=data, timeout=REQUEST_TIMEOUT)
@@ -169,6 +171,9 @@ def reset_cookie_dead_flag() -> None:
     save_state(state)
 
 
+# =========================
+# MAP BUTTON
+# =========================
 def map_btn(origin: str, dest: str) -> dict:
     url = (
         "https://www.google.com/maps/dir/?api=1"
@@ -183,6 +188,9 @@ def map_btn(origin: str, dest: str) -> dict:
     }
 
 
+# =========================
+# MESSAGE BUILDERS
+# =========================
 def build_initial_message(task: dict) -> str:
     return (
         "🚨 <b>NEW TASK LOAD</b>\n\n"
@@ -219,11 +227,21 @@ def build_full_message(task: dict, detail: dict) -> str:
     if detail.get("team_driver"):
         parts.append(f"Special: <b>{escape_html(detail['team_driver'])}</b>")
 
+    if detail.get("raw_text"):
+        raw = detail["raw_text"]
+        if len(raw) > 500:
+            raw = raw[:500] + "..."
+        parts.append("")
+        parts.append(f"<i>{escape_html(raw)}</i>")
+
     return "\n".join(parts)
 
 
+# =========================
+# TASKS
+# =========================
 def get_tasks() -> list[dict]:
-    r = session.get(TASKS_URL, timeout=REQUEST_TIMEOUT)
+    r = requests.get(TASKS_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     html_text = r.text
 
@@ -301,6 +319,9 @@ def get_tasks() -> list[dict]:
     return tasks
 
 
+# =========================
+# DETAIL
+# =========================
 def get_detail(task: dict) -> dict:
     data = {
         "providerId": task["provider_id"],
@@ -309,7 +330,11 @@ def get_detail(task: dict) -> dict:
         "selectedTab": task["selected_tab"],
     }
 
-    r = session.post(DETAIL_URL, data=data, timeout=REQUEST_TIMEOUT)
+    detail_headers = dict(HEADERS)
+    detail_headers["referer"] = TASKS_URL
+    detail_headers["content-type"] = "application/x-www-form-urlencoded"
+
+    r = requests.post(DETAIL_URL, headers=detail_headers, data=data, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     html_text = r.text
 
@@ -339,7 +364,13 @@ def get_detail(task: dict) -> dict:
     }
 
 
+# =========================
+# MAIN
+# =========================
 def main():
+    global state
+    state = load_state()
+
     logging.info("AOD started...")
     send_startup_message_once()
 
