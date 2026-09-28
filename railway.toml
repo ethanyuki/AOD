@@ -2,5 +2,5 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python aod.py"
+startCommand = "python aod_task_bot.py"
 restartPolicyType = "ALWAYS"
