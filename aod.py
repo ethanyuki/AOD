@@ -18,7 +18,7 @@ AOD_PASSWORD = os.getenv("AOD_PASSWORD", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.5"))
 POST_EXISTING_ON_START = os.getenv("POST_EXISTING_ON_START", "false").strip().lower() in {
     "1", "true", "yes", "y"
 }
@@ -44,6 +44,8 @@ logger = logging.getLogger("AOD_BOT")
 
 zip_lookup = pgeocode.Nominatim("us")
 zip_cache = {}
+shipment_status_cache = {}
+telegram_session = requests.Session()
 
 
 def zip_to_city_state(zip_code):
@@ -78,34 +80,41 @@ def init_database():
             )
             """
         )
+        rows = conn.execute(
+            "SELECT shipment_id, telegram_sent FROM shipments"
+        ).fetchall()
+        shipment_status_cache.clear()
+        shipment_status_cache.update(
+            {str(shipment_id): int(sent) for shipment_id, sent in rows}
+        )
         conn.commit()
 
 
 def shipment_status(shipment_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        row = conn.execute(
-            "SELECT telegram_sent FROM shipments WHERE shipment_id = ?",
-            (shipment_id,),
-        ).fetchone()
-    return None if row is None else int(row[0])
+    return shipment_status_cache.get(str(shipment_id))
 
 
 def save_shipment(shipment_id, telegram_sent=False):
+    shipment_id = str(shipment_id)
+    sent_value = 1 if telegram_sent else 0
+
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute(
             """
             INSERT INTO shipments (shipment_id, first_seen, telegram_sent)
             VALUES (?, ?, ?)
-            ON CONFLICT(shipment_id) DO UPDATE SET telegram_sent = excluded.telegram_sent
+            ON CONFLICT(shipment_id) DO UPDATE SET
+                telegram_sent = excluded.telegram_sent
             """,
             (
                 shipment_id,
                 datetime.now(timezone.utc).isoformat(),
-                1 if telegram_sent else 0,
+                sent_value,
             ),
         )
         conn.commit()
 
+    shipment_status_cache[shipment_id] = sent_value
 
 def create_session():
     session = requests.Session()
@@ -387,56 +396,116 @@ def escape_html(text):
     )
 
 
+def location_state(location):
+    location = clean_text(location)
+    if "," not in location:
+        return ""
+    state = location.rsplit(",", 1)[-1].strip().upper()
+    return state if re.fullmatch(r"[A-Z]{2}", state) else ""
+
+
+def format_weight_value(value):
+    value = clean_text(value)
+    if not value:
+        return ""
+
+    lower = value.lower()
+    numeric = re.sub(r"[^0-9.\-]", "", value)
+
+    if numeric:
+        try:
+            number = float(numeric)
+            return f"{number:,.2f} lb"
+        except ValueError:
+            pass
+
+    if "lb" in lower:
+        return value
+
+    return f"{value} lb"
+
+
 def format_load_message(load):
     shipment = escape_html(load.get("shipment_id", ""))
     mode = escape_html(load.get("mode", ""))
-    origin = escape_html(zip_to_city_state(load.get("origin", "")))
-    destination = escape_html(zip_to_city_state(load.get("destination", "")))
+
+    origin_text = zip_to_city_state(load.get("origin", ""))
+    destination_text = zip_to_city_state(load.get("destination", ""))
+
+    origin = escape_html(origin_text)
+    destination = escape_html(destination_text)
+
+    origin_state = location_state(origin_text)
+    destination_state = location_state(destination_text)
+
+    lane = ""
+    if origin_state and destination_state:
+        lane = f"{origin_state}-{destination_state}"
+
     ready = escape_html(load.get("ready_time", ""))
     need = escape_html(load.get("need_time", ""))
-    weight = escape_html(load.get("weight", ""))
+    weight = escape_html(format_weight_value(load.get("weight", "")))
     containers = escape_html(load.get("containers", ""))
-    last_bid = escape_html(load.get("last_bid", ""))
-    csr = escape_html(load.get("csr", ""))
 
-    lines = [
-        "🚨 <b>AOD NEW LOAD</b>",
-        "",
-        f"🆔 <b>Shipment:</b> <code>{shipment}</code>",
-    ]
+    lines = []
+
+    if lane:
+        lines.append(f"<b>{escape_html(lane)}</b>")
+        lines.append("")
+
+    lines.append(
+        f"🆔 <b>Shipment:</b> <code>{shipment}</code>"
+    )
 
     if mode:
-        lines.append(f"🚛 <b>Mode:</b> {mode}")
+        lines.append(
+            f"🚛 <b>Mode:</b> {mode}"
+        )
 
-    lines.extend(["", "🟢 <b>PICK UP</b>"])
+    lines.extend([
+        "",
+        "🟢 <b>PICK UP</b>",
+    ])
+
     if origin:
-        lines.append(f"📍 {origin}")
+        lines.append(
+            f"📍 {origin}"
+        )
+
     if ready:
-        lines.append(f"🕐 {ready}")
+        lines.append(
+            f"🕐 {ready}"
+        )
 
-    lines.extend(["", "🔴 <b>DELIVERY</b>"])
+    lines.extend([
+        "",
+        "🔴 <b>DELIVERY</b>",
+    ])
+
     if destination:
-        lines.append(f"📍 {destination}")
-    if need:
-        lines.append(f"🕒 {need}")
+        lines.append(
+            f"📍 {destination}"
+        )
 
-    lines.append("")
+    if need:
+        lines.append(
+            f"🕒 {need}"
+        )
+
+    if weight or containers:
+        lines.append("")
 
     if weight:
-        lines.append(f"⚖️ <b>Weight:</b> {weight}")
+        lines.append(
+            f"⚖️ <b>Weight:</b> {weight}"
+        )
+
     if containers:
-        lines.append(f"📦 <b>Containers:</b> {containers}")
-    if last_bid:
-        if last_bid.upper() == "DECLINE":
-            lines.append("💰 <b>Last Bid:</b> ❌ DECLINE")
-        else:
-            lines.append(f"💰 <b>Last Bid:</b> {last_bid}")
-    if csr:
-        lines.append(f"👤 <b>CSR:</b> {csr}")
+        lines.append(
+            f"📦 <b>Containers:</b> {containers}"
+        )
 
-    lines.extend(["", "⚡ <i>New load detected by AOD Bot</i>"])
     return "\n".join(lines)
-
 
 def send_telegram(load):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -461,7 +530,7 @@ def send_telegram(load):
         }
 
     try:
-        response = requests.post(
+        response = telegram_session.post(
             url,
             json=payload,
             timeout=REQUEST_TIMEOUT,
@@ -593,7 +662,7 @@ def main():
             time.sleep(10)
 
         elapsed = time.monotonic() - started
-        time.sleep(max(0.1, POLL_INTERVAL - elapsed))
+        time.sleep(max(0.02, POLL_INTERVAL - elapsed))
 
 
 if __name__ == "__main__":
